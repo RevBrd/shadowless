@@ -408,6 +408,8 @@ button,input,select{font-family:inherit;font-size:inherit;color:inherit}
 .deckscreen.starter .dsplitlbl{color:var(--matink)}
 .proflast{min-height:12px;font-size:8.5px;letter-spacing:.24em;color:var(--amber);margin-top:2px}
 .titlefoot{display:flex;justify-content:center}
+.buildstamp{font-size:9.5px;letter-spacing:.12em;color:var(--dim);text-align:center;margin-top:8px;opacity:.7;user-select:text}
+.sethint.buildstamp{text-align:left;margin-top:10px}
 .profrow{display:flex;gap:10px 22px;align-items:flex-end;justify-content:center;flex-wrap:wrap;
   padding-bottom:clamp(6px,1.4vh,12px);border-bottom:1px solid var(--matline)}
 .proffields{display:flex;gap:14px;align-items:flex-end;flex-wrap:wrap;justify-content:center}
@@ -9987,6 +9989,9 @@ const ABLATABLE = new Set([
 'checkKills',
 'attackHealRescue',
 'selfSleepTurn',
+'statusLifetime',
+'certainTurns',
+'freeKoNext',
 ]);
 function aiParseDamage(d) {
 if (!d) return 0;
@@ -11297,6 +11302,13 @@ const atkSlot = me.active;
 let s = f.expUseful * W.damage;
 if (f.pLethal > 0) {
 s += f.pLethal * this.koWeightFor(pi, you.active).weight;
+if (this.on('freeKoNext')) {
+const free = this.freeKoLater(pi, idx, vopts, f);
+if (free) {
+const turn = this.statusWorthAgainst(pi, 'Paralyzed', 1, atkSlot, f.expDmg);
+s -= f.pLethal * Math.max(0, this.koWeightFor(pi, you.active).weight - turn);
+}
+}
 const dyingPower = you.active && this.E.powerOf(you.active);
 if (dyingPower && dyingPower.kind === 'ON_KO' && f.pLethal > 0
 && this.E.powerUsable(you.active)) {
@@ -11819,6 +11831,17 @@ const horizon = tBest <= 2 ? 1 : 1 / ((tBest - 1) * (tBest - 1));
 const turn = this.statusWorthAgainst(pi, 'Paralyzed', 1, atkSlot, dThis);
 s -= (tThis - tBest) * turn * horizon * W.freeRider;
 }
+}
+}
+if (this.on('certainTurns') && f.pLethal <= 0 && you.active && f.outcomes && f.outcomes.length > 1
+&& f.expDmg > 0 && !f.blocked) {
+const hpThem = this.remainingHP(you.active);
+const eT = this.expectedTurnsToKO(hpThem, f.outcomes);
+if (hpThem > 0 && Number.isFinite(eT)) {
+const tMean = Math.ceil(hpThem / f.expDmg);
+const tRef = Math.min(tMean, eT);
+const horizon = tRef <= 2 ? 1 : 1 / ((tRef - 1) * (tRef - 1));
+s -= (eT - tMean) * f.expUseful * W.damage * horizon;
 }
 }
 if (atkSlot.status.confused) {
@@ -12815,6 +12838,42 @@ if (cost > worst) worst = cost;
 });
 return worst;
 }
+freeKoLater(pi, idx, vopts, f) {
+const E = this.E, me = E.state.players[pi], you = E.state.players[1 - pi];
+const atkSlot = me.active;
+if (!atkSlot || !you.active || me.prizes.length <= 1) return false;
+const costly = (f.energyCost > 0) || (f.discardBranches || []).some(b => b.energyCost > 0 && b.p > 0);
+if (!costly) return false;
+if (this.threatNextTurn(pi, atkSlot) >= this.remainingHP(atkSlot)) return false;
+const hp = this.remainingHP(you.active);
+const same = a => a.idx === idx && JSON.stringify(a.opts || null) === JSON.stringify(vopts || null);
+for (const a of E.legalActions(pi)) {
+if (a.t !== 'attack' || same(a)) continue;
+const g = this.forecast(pi, a.idx, a.opts);
+if (!g || g.blocked || g.energyCost > 0 || (g.discardBranches || []).some(b => b.energyCost > 0)) continue;
+const least = (g.outcomes || []).reduce((m, o) => Math.min(m, o.dmg || 0), Infinity);
+if (least > 0 && least < hp && 2 * least >= hp) return true;
+}
+return false;
+}
+expectedTurnsToKO(hp, outcomes) {
+const n = Math.ceil(hp / 10);
+if (n <= 0) return 0;
+let p0 = 0;
+const hits = [];
+for (const o of outcomes) {
+const d = Math.ceil((o.dmg || 0) / 10);
+if (d <= 0) p0 += o.p; else hits.push([o.p, d]);
+}
+if (!hits.length || p0 >= 1) return Infinity;
+const T = [0];
+for (let h = 1; h <= n; h++) {
+let acc = 1;
+for (const [p, d] of hits) acc += p * (h - d > 0 ? T[h - d] : 0);
+T.push(acc / (1 - p0));
+}
+return T[n];
+}
 boughtTurn(pi, slot, dThisTurn) {
 const you = this.E.state.players[1 - pi];
 const threat = this.incomingThreat(pi);
@@ -12833,9 +12892,13 @@ const slot = ourSlot || me.active;
 const threat = Math.max(this.incomingThreat(pi), this.threatNextTurn(pi, slot));
 let denied = Math.min(threat, this.remainingHP(slot) || Infinity);
 let converts = true;
+let lastTurn = false;
 if (DENIES_A_TURN[st]) {
 const t = this.boughtTurn(pi, slot, dThisTurn);
 converts = t.converts;
+const dNow = dThisTurn === undefined ? t.dMax : dThisTurn;
+lastTurn = this.on('statusLifetime') && t.dMax > 0
+&& this.remainingHP(you.active) - dNow > 0 && this.remainingHP(you.active) - dNow <= t.dMax;
 if (!converts && t.lethal && st !== 'Confused') denied = t.dMax;
 if (!converts && stallOnly && t.dMax > 0 && st !== 'Confused' && this.on('stallNoDamage')
 && (!this.on('stallRaceOnly') || this.racingDamage(pi) > 0)) denied = 0;
@@ -12848,7 +12911,8 @@ const frac = converts && DENIES_A_TURN[st] && hpLeft > 0 ? Math.min(1, denied / 
 const lifeShare = frac >= 1 ? Math.min(1, this.pKilledNextTurn(pi, slot)) : frac * frac;
 const life = lifeShare * this.W.selfKO * (NEXT_ATTACK_DENIED[st] || 0);
 const severity = st === 'Poisoned' && tick ? Math.max(1, tick / 10) : 1;
-return (this.W[key] * turnScale + life) * this.statusNovelty(st, you.active, tick) * aliveFactor * severity;
+const weight = lastTurn ? Math.min(this.W[key], this.W.paralyze * (NEXT_ATTACK_DENIED[st] || 0)) : this.W[key];
+return (weight * turnScale + life) * this.statusNovelty(st, you.active, tick) * aliveFactor * severity;
 }
 discardSilence(pi, slot, f) {
 const left = this.discardLeft(slot, f);
@@ -24990,7 +25054,7 @@ return Object.assign({}, deckDef, { list });
 }
 function newEventLog(meta) {
 return {
-meta: Object.assign({ started: null, seed: null, decks: [], tier: null, prizes: null }, meta || {}),
+meta: Object.assign({ started: null, seed: null, decks: [], tier: null, prizes: null, build: null }, meta || {}),
 entries: [],
 packs: [],
 result: null,
@@ -25029,6 +25093,7 @@ if (m.decks && m.decks.length === 2) L.push(`decks    you: ${m.decks[0]}   oppon
 if (m.tier) L.push(`opponent ${m.tier}`);
 if (m.seed !== null && m.seed !== undefined) L.push(`seed     ${m.seed}   (deck select accepts this — the match replays exactly)`);
 if (m.prizes) L.push(`prizes   ${m.prizes} each`);
+if (m.build) L.push(`build    ${m.build}`);
 L.push('');
 L.push('Lines marked HIDDEN were never shown on screen. That is the point of');
 L.push('this file: the opponent\'s hand, both Prize piles, and what the AI');
@@ -25195,6 +25260,7 @@ blurb: (src && src.blurb) || '',
 generated: !src,
 cfg: bcfg,
 roster, boss, extra,
+formerBosses: formerBossIds(src, setCode, boss.id),
 };
 });
 }
@@ -25215,7 +25281,14 @@ function tierOpen(save, bracket, tier) {
 if (bracket.roster.some(o => o.tier === tier && hasBeaten(save, o.id))) return true;
 return bracket.roster.filter(o => o.tier < tier).every(o => hasBeaten(save, o.id));
 }
-const bracketCleared = (save, bracket) => hasBeaten(save, bracket.boss.id);
+function formerBossIds(src, setCode, bossId) {
+const ids = ((src && src.formerBosses) || []).slice();
+const generated = `${setCode}-boss`;
+if (bossId !== generated && ids.indexOf(generated) < 0) ids.push(generated);
+return ids.filter(id => id !== bossId);
+}
+const bracketCleared = (save, bracket) =>
+hasBeaten(save, bracket.boss.id) || (bracket.formerBosses || []).some(id => hasBeaten(save, id));
 function bracketOpen(save, ladder, index) {
 if (index <= 0) return true;
 return bracketCleared(save, ladder[index - 1]);
@@ -25933,6 +26006,7 @@ seed,
 decks: [UI.myDeck, foeDeckLabel()],
 tier: UI.foeTier || UI.aiMode,
 prizes: (UI.cfgDraft && UI.cfgDraft.prizes) || null,
+build: BUILD_STAMP,
 });
 UI.elogLen = 0;
 UI.elogTurn = null;
@@ -26381,6 +26455,7 @@ applySigilMarks(d, flags);
 return d;
 }
 const SCAN_BASE = 'https://images.pokemontcg.io/';
+const BUILD_STAMP = 'v0.8.1 · a414b45';
 function cardFaceImage(card, host) {
 const m = /^([a-z0-9]+)-(.+)$/.exec(card.id || '');
 if (!m) return null;
@@ -29366,6 +29441,7 @@ const imp = el('button', 'kit-link', 'Import a save as a new profile');
 imp.onclick = () => { UI.importing = true; UI.importAsNew = true; UI.importErr = ''; UI.importNote = ''; render(); };
 foot.appendChild(imp);
 box.appendChild(foot);
+box.appendChild(el('div', 'buildstamp', BUILD_STAMP));
 ov.appendChild(box);
 return ov;
 }
@@ -32149,6 +32225,7 @@ tseg.appendChild(b);
 });
 tools.appendChild(tseg);
 box.appendChild(tools);
+box.appendChild(el('div', 'sethint buildstamp', 'Shadowless ' + BUILD_STAMP));
 const bar = el('div', 'sheetbar');
 if (UI.forfeitArmed) {
 bar.appendChild(el('span', 'setwarn', 'Forfeit and take the loss?'));
