@@ -9909,6 +9909,8 @@ drag: 14,
 dragKill: 40,
 dragNoKill: -30,
 gustHold: 48,
+holdOccasion: 0.5,
+holdDeck: 8,
 healDisarm: 22,
 healWaste: 4.0,
 shieldSelf: 20,
@@ -9992,6 +9994,12 @@ const ABLATABLE = new Set([
 'statusLifetime',
 'certainTurns',
 'freeKoNext',
+'silenceAfterKo',
+'oldRodHold',
+'occasionNextTurn', 'holdOccasion',
+'defenderTurns',
+'searchPicks', 'fetchBeforeClear',
+'evolveBeforeClear',
 ]);
 function aiParseDamage(d) {
 if (!d) return 0;
@@ -11307,6 +11315,7 @@ const free = this.freeKoLater(pi, idx, vopts, f);
 if (free) {
 const turn = this.statusWorthAgainst(pi, 'Paralyzed', 1, atkSlot, f.expDmg);
 s -= f.pLethal * Math.max(0, this.koWeightFor(pi, you.active).weight - turn);
+s -= f.pLethal * W.damage * Math.max(0, f.expUseful - Math.min(free, this.remainingHP(you.active)));
 }
 }
 const dyingPower = you.active && this.E.powerOf(you.active);
@@ -11414,8 +11423,15 @@ if (silence > 0) {
 const turnsSilent = this.silenceTurns(pi, atkSlot,
 { energyCost: br.energyCost, discardTypes: br.discardTypes, flags: { discardAll: br.discardAll } });
 const left = this.turnsLeft(pi, atkSlot);
-const felt = left === Infinity ? turnsSilent : Math.min(turnsSilent, left + 0.75);
-s -= br.p * W.energyDiscard * felt * felt;
+const feltAt = l => (l === Infinity ? turnsSilent : Math.min(turnsSilent, l + 0.75));
+let cost = feltAt(left) * feltAt(left);
+if (this.on('silenceAfterKo') && f.pLethal > 0 && atkSlot === me.active && you.bench.length) {
+let threatRep = 0;
+for (const b of you.bench) threatRep = Math.max(threatRep, this.threatNextFrom(b, atkSlot));
+const leftRep = threatRep <= 0 ? Infinity : Math.max(0, Math.ceil(this.remainingHP(atkSlot) / threatRep) - 1);
+cost = f.pLethal * feltAt(leftRep) * feltAt(leftRep) + (1 - f.pLethal) * cost;
+}
+s -= br.p * W.energyDiscard * cost;
 }
 }
 if (f.flags.benchSplash) {
@@ -12841,20 +12857,22 @@ return worst;
 freeKoLater(pi, idx, vopts, f) {
 const E = this.E, me = E.state.players[pi], you = E.state.players[1 - pi];
 const atkSlot = me.active;
-if (!atkSlot || !you.active || me.prizes.length <= 1) return false;
+if (!atkSlot || !you.active || me.prizes.length <= 1) return 0;
+if (this.koWeightFor(pi, you.active).wins) return 0;
 const costly = (f.energyCost > 0) || (f.discardBranches || []).some(b => b.energyCost > 0 && b.p > 0);
-if (!costly) return false;
-if (this.threatNextTurn(pi, atkSlot) >= this.remainingHP(atkSlot)) return false;
+if (!costly) return 0;
+if (this.threatNextTurn(pi, atkSlot) >= this.remainingHP(atkSlot)) return 0;
 const hp = this.remainingHP(you.active);
+let found = 0;
 const same = a => a.idx === idx && JSON.stringify(a.opts || null) === JSON.stringify(vopts || null);
 for (const a of E.legalActions(pi)) {
 if (a.t !== 'attack' || same(a)) continue;
 const g = this.forecast(pi, a.idx, a.opts);
 if (!g || g.blocked || g.energyCost > 0 || (g.discardBranches || []).some(b => b.energyCost > 0)) continue;
 const least = (g.outcomes || []).reduce((m, o) => Math.min(m, o.dmg || 0), Infinity);
-if (least > 0 && least < hp && 2 * least >= hp) return true;
+if (least > 0 && least < hp && 2 * least >= hp) found = Math.max(found, least);
 }
-return false;
+return found;
 }
 expectedTurnsToKO(hp, outcomes) {
 const n = Math.ceil(hp / 10);
@@ -12970,8 +12988,14 @@ return best === Infinity ? 0 : best;
 }
 healRescues(pi, slot, heal) {
 if (!slot || slot !== this.E.state.players[pi].active) return false;
-const threat = this.incomingThreat(pi), rem = this.remainingHP(slot);
+const threat = this.occasionThreat(pi), rem = this.remainingHP(slot);
 return threat >= rem && rem + heal > threat;
+}
+occasionThreat(pi) {
+const now = this.incomingThreat(pi);
+if (!this.on('occasionNextTurn')) return now;
+const me = this.E.state.players[pi];
+return Math.max(now, me.active ? this.threatNextTurn(pi, me.active) : 0);
 }
 healKept(pi, slot, heal) {
 if (!slot || slot !== this.E.state.players[pi].active || heal <= 0) return 1;
@@ -13318,7 +13342,7 @@ slot.typeAs = a.type; this.touch();
 let after;
 try { after = (() => { const b = this.bestAttackScore(pi); return b.score === -Infinity ? 0 : b.score; })(); }
 finally { slot.typeAs = saved; this.touch(); }
-return after - before;
+return after - before - 0.5;
 }
 case 'EVOLVE_FROM_DECK_ON_FLIP': {
 const me = E.state.players[pi], here = this.top(slot);
@@ -13520,6 +13544,13 @@ a.opts = a.opts || {};
 a.opts.bench = sn.scalar ? pick.picks[0] : pick.picks;
 }
 }
+}
+}
+if (me.active && this.on('searchPicks')) {
+const call = this.fillScript(pi, me.active, a.idx, a.opts).find(v => v.v === 'SEARCH_BASIC_TO_BENCH');
+if (call) {
+const pk = this.fetchPick(pi, c2 => E.callMatches(c2, call), false);
+if (pk) { a.opts = a.opts || {}; a.opts.pickUid = pk.uid; }
 }
 }
 if (me.active) {
@@ -13854,9 +13885,10 @@ const slot = E.allSlots(pi).find(x => x.uid === a.target);
 if (!slot) return -Infinity;
 const oldC = this.top(slot), newC = this.db[me.hand[a.hand].id];
 let s = W.evolveBase + Math.max(0, newC.hp - oldC.hp) * W.evolveHP;
+const clearE = this._handGoing && this.on('evolveBeforeClear');
 const want = this.roadWant(pi, slot, newC.id);
-if (want > 0) s -= want * W.evolveEarly;
-if (this.evolveHeld(pi, slot, newC)) {
+if (want > 0 && !clearE) s -= want * W.evolveEarly;
+if (!clearE && this.evolveHeld(pi, slot, newC)) {
 s -= W.evolveBase + Math.max(0, newC.hp - oldC.hp) * W.evolveHP;
 }
 if (this.on('evolveCure')) s += this.ownStatusCost(pi, slot);
@@ -14403,6 +14435,7 @@ const inst = me.hand[a.hand];
 const script = (this.eff[inst.id] && this.eff[inst.id].t) || [];
 let s = 0;
 let coinMult = 1;
+let occ = 0;
 a.opts = a.opts || {};
 const finisher = this.bestAttackScore(pi);
 let killingActiveNow = false, pKillActive = 0;
@@ -14414,7 +14447,14 @@ if (f && f.pLethal >= 0.85) killingActiveNow = true;
 const holdFactor = 2 * (1 - pKillActive) - 1;
 for (const v of script) {
 switch (v.v) {
-case 'T_POKE_BALL': s += 0.5 * W.drawCard * 2; break;
+case 'T_POKE_BALL': {
+const isMon = c => c.kind === 'pokemon';
+const clear = this._handGoing && this.on('fetchBeforeClear');
+if (clear && !this.deckMayHold(pi, x => isMon(this.db[x.id]) && this.playableNow(pi, x))) return -Infinity;
+if (this.on('searchPicks')) { const pk = this.fetchPick(pi, isMon, clear); if (pk) a.opts.pickUid = pk.uid; }
+s += 0.5 * W.drawCard * 2;
+break;
+}
 case 'T_FOSSIL_EGG':
 case 'T_SEARCH_TO_BENCH': {
 const fp = { nameHas: v.nameHas };
@@ -14437,7 +14477,9 @@ const matchS = x => E.searchMatches(this.db[x.id], v);
 const fitsS = x => inPlay.has(this.db[x.id].evolvesFrom);
 if (!me.deck.length || !this.unseen(pi).some(matchS)) return -Infinity;
 const fits = this.unseen(pi).some(x => matchS(x) && fitsS(x));
-const realS = me.deck.filter(matchS);
+const clearS = this._handGoing && this.on('fetchBeforeClear');
+if (clearS && !this.unseen(pi).some(x => matchS(x) && this.playableNow(pi, x))) return -Infinity;
+const realS = me.deck.filter(x => matchS(x) && (!clearS || this.playableNow(pi, x)));
 const pickS = realS.find(fitsS) || realS[0];
 a.opts.pickUid = pickS ? pickS.uid : undefined;
 s += W.drawCard + (fits ? 10 : 0);
@@ -14500,7 +14542,17 @@ if (kills) s += (1 / 3) * W.knockout;
 if (dies) s -= (2 / 3) * W.selfKO;
 break;
 }
-case 'T_ENERGY_SEARCH': s += W.drawCard; break;
+case 'T_ENERGY_SEARCH': {
+const isBasicE = c => c.kind === 'energy' && c.cls === 'Basic';
+const clear = this._handGoing && this.on('fetchBeforeClear');
+if (clear && !this.deckMayHold(pi, x => isBasicE(this.db[x.id]) && this.playableNow(pi, x))) return -Infinity;
+if (this.on('searchPicks')) {
+if (v.coins) a.opts.pickUids = this.fetchPick(pi, isBasicE, clear, v.coins).map(x => x.uid);
+else { const pk = this.fetchPick(pi, isBasicE, clear); if (pk) a.opts.pickUid = pk.uid; }
+}
+s += W.drawCard;
+break;
+}
 case 'T_MR_FUJI': {
 let best = null, bestV = -Infinity;
 for (const b of me.bench) {
@@ -14833,6 +14885,7 @@ case 'T_HEAL': {
 const cands = E.allSlots(pi).filter(x => x.dmg > 0 && !E.legendShield(x));
 if (!cands.length) return -Infinity;
 const nEff = v.coins ? v.n * v.coins / 2 : v.n;
+occ = nEff * W.healPer10 + W.healRescue;
 const value = c => {
 const heal = Math.min(nEff * 10, c.dmg);
 return heal / 10 * W.healPer10 * this.healKept(pi, c, heal)
@@ -14851,6 +14904,7 @@ break;
 case 'T_DISCARD_ENERGY_THEN_HEAL': {
 const cands = E.allSlots(pi).filter(x => x.dmg > 0 && x.energy.length && !E.legendShield(x));
 if (!cands.length) return -Infinity;
+occ = v.n * W.healPer10 - W.energyDiscard + W.healRescue;
 const value = c => {
 const heal = Math.min(v.n * 10, c.dmg);
 let x = heal / 10 * W.healPer10 * this.healKept(pi, c, heal) - W.energyDiscard
@@ -15046,11 +15100,17 @@ s += sick ? this.ownStatusCost(pi, sick) : (tgt === me.active ? 2 : 0.5);
 break;
 }
 case 'T_DEFENDER': {
-const danger = this.incomingThreat(pi);
+const danger = this.occasionThreat(pi);
 if (!me.active || E.legendShield(me.active)) return -Infinity;
 a.opts.targetUid = me.active.uid;
 s += danger > 0 ? 8 : -2;
-if (danger >= this.remainingHP(me.active) && danger - 20 < this.remainingHP(me.active)) s += 26;
+const remD = this.remainingHP(me.active);
+if (this.on('defenderTurns') && danger > 0) {
+const nNow = Math.ceil(remD / danger), nWith = Math.ceil((remD + Math.min(20, danger)) / danger);
+const worth = 0.4 + 0.6 * Math.min(1, this.slotLossCost(pi, me.active) / W.dangerSwap);
+if (nWith > nNow) s += 26 * worth / nNow;
+} else if (danger >= remD && danger - 20 < remD) s += 26;
+occ = 8 + 26;
 const best = this.bestAttackScore(pi);
 if (best && best.idx >= 0) {
 const f = this.forecast(pi, best.idx, best.vopts);
@@ -15069,6 +15129,7 @@ if (v.cost > 1) {
 const junk2 = this.rankHandJunk(pi, inst.uid).slice(0, v.cost);
 if (!basics.length || junk2.length < v.cost) return -Infinity;
 a.opts.discardUids = junk2;
+if (this.on('searchPicks')) a.opts.pickUids = this.retrievePicks(pi, v.n, junk2);
 s += Math.min(v.n, basics.length) * 6 - (v.cost - 1) * W.drawCard * 0.6;
 break;
 }
@@ -15076,6 +15137,7 @@ if (!basics.length || me.hand.length < 2) return -Infinity;
 const junk = this.worstHandCard(pi, inst.uid);
 if (junk === null) return -Infinity;
 a.opts.discardUid = junk;
+if (this.on('searchPicks')) a.opts.pickUids = this.retrievePicks(pi, v.n, [junk]);
 s += Math.min(v.n, basics.length) * 6;
 break;
 }
@@ -15251,8 +15313,10 @@ const deckMons = me.deck.filter(isMon);
 if (!handMons.length || !me.deck.length || !this.unseen(pi).some(isMon)) return -Infinity;
 const inPlay = E.allSlots(pi).map(x => this.top(x).name);
 const fitsT = x => { const c = this.db[x.id]; return c.evolvesFrom && inPlay.includes(c.evolvesFrom); };
+const clearT = this._handGoing && this.on('fetchBeforeClear');
+if (clearT && !this.unseen(pi).some(x => isMon(x) && this.playableNow(pi, x))) return -Infinity;
 const wantSeen = this.unseen(pi).some(x => isMon(x) && fitsT(x));
-const want = deckMons.find(fitsT);
+const want = clearT ? deckMons.find(x => this.playableNow(pi, x)) : deckMons.find(fitsT);
 const junkMon = handMons.find(x => {
 const c = this.db[x.id];
 return c.evolvesFrom && !inPlay.includes(c.evolvesFrom);
@@ -15306,7 +15370,14 @@ case 'T_OLD_ROD': {
 const pk = me.discard.some(x => (this.db[x.id] || {}).kind === 'pokemon');
 const tr = me.discard.some(x => (this.db[x.id] || {}).kind === 'trainer');
 if (!pk && !tr) return -Infinity;
-s += (0.25 * (pk ? 1.2 : 0) + 0.25 * (tr ? 1 : 0)) * W.drawCard;
+const now = (0.25 * (pk ? 1.2 : 0) + 0.25 * (tr ? 1 : 0)) * W.drawCard;
+s += now;
+if (this.on('oldRodHold') && (pk !== tr)) {
+const act = me.active;
+const pressed = me.deck.length <= 8
+|| (act && this.threatNextTurn(pi, act) >= this.remainingHP(act));
+if (!pressed) s -= 0.75 * (0.25 * 1.2 + 0.25) * W.drawCard;
+}
 break;
 }
 case 'T_BREEDER_FIELDS': {
@@ -15364,7 +15435,15 @@ break;
 }
 }
 }
-return s * coinMult;
+return s * coinMult - (occ > 0 && this.on('holdOccasion') ? this.holdValue(pi, inst, occ) : 0);
+}
+holdValue(pi, inst, occ) {
+const E = this.E, W = this.W, me = E.state.players[pi], you = E.state.players[1 - pi];
+if (this._handGoing) return 0;
+if (me.hand.filter(c => c.id === inst.id).length > 1) return 0;
+let later = Math.min(1, me.deck.length / W.holdDeck);
+if (me.active && you.prizes.length <= 1) later *= 1 - this.pKilledNextTurn(pi, me.active);
+return W.holdOccasion * later * occ;
 }
 rankHandJunk(pi, excludeUid) {
 return this.handDiscardOrder(pi, excludeUid).map(x => x.uid);
@@ -15372,6 +15451,42 @@ return this.handDiscardOrder(pi, excludeUid).map(x => x.uid);
 worstHandCard(pi, excludeUid) {
 const r = this.rankHandJunk(pi, excludeUid);
 return r.length ? r[0] : null;
+}
+fetchPick(pi, matches, playableOnly, n = 1, pool) {
+const E = this.E, me = E.state.players[pi], inPlay = E.allSlots(pi);
+const ranked = [];
+for (const x of (pool || me.deck)) {
+const c = this.db[x.id];
+if (!c || !matches(c)) continue;
+if (playableOnly && !this.playableNow(pi, x)) continue;
+let v = this.cardKeepValue(pi, x, inPlay);
+if (c.kind === 'pokemon' && !c.evolvesFrom) {
+const evo = y => (this.db[y.id] || {}).evolvesFrom === c.name;
+v += me.hand.some(evo) ? 0.5 : this.deckMayHold(pi, evo) ? 0.25 : 0;
+v += (c.hp || 0) / 1000;
+}
+if (c.kind === 'energy' && c.provides && c.provides.length === 1 && c.provides !== 'C' && c.provides !== AI_WILD) {
+const t = c.provides;
+if (inPlay.some(sl => (this.top(sl).attacks || []).some(atk =>
+atk.cost.split('').filter(y => y === t).length > E.slotSymbols(sl).filter(y => y === t).length))) v += 0.3;
+}
+ranked.push({ x, v });
+}
+ranked.sort((p, q) => q.v - p.v);
+return n === 1 ? (ranked[0] ? ranked[0].x : null) : ranked.slice(0, n).map(r => r.x);
+}
+retrievePicks(pi, n, without) {
+const me = this.E.state.players[pi];
+const pool = me.discard.filter(x => !(without || []).includes(x.uid));
+return this.fetchPick(pi, c => c.kind === 'energy' && c.cls === 'Basic', false, n, pool).map(x => x.uid);
+}
+playableNow(pi, inst) {
+const E = this.E, me = E.state.players[pi], c = this.db[inst.id];
+if (!c) return false;
+if (c.kind === 'energy') return !me.energyAttached && this.energyPays(pi, inst.id, E.allSlots(pi)) > 0;
+if (c.kind !== 'pokemon') return false;
+if (!c.evolvesFrom) return me.bench.length < E.benchCap();
+return E.allSlots(pi).some(sl => E.canEvolve(pi, sl, c));
 }
 wantFromDeck(pi) {
 const E = this.E, me = E.state.players[pi];
@@ -15420,11 +15535,15 @@ const worth = a => this.scoreAction(pi, a) >= this.W.threshold;
 const pick = list => (list.length ? this.pickBest(pi, list) : null);
 if (this.emptiesHand(pi, best)) {
 const me = this.E.state.players[pi], inPlay = this.E.allSlots(pi);
-const save = setup.filter(a => a !== best && a.hand !== undefined
+this._handGoing = true;
+let save;
+try {
+save = setup.filter(a => a !== best && a.hand !== undefined
 && ['evolve', 'playBasic', 'attachEnergy', 'playTrainer'].includes(a.t)
 && !this.emptiesHand(pi, a) && me.hand[a.hand]
 && (sc => sc >= 0 && sc + 0.55 * this.cardKeepValue(pi, me.hand[a.hand], inPlay) >= this.W.threshold)(this.scoreAction(pi, a)));
-if (save.length) return pick(save);
+} finally { this._handGoing = false; }
+if (save.length) { this._handGoing = true; try { return pick(save); } finally { this._handGoing = false; } }
 }
 if (best.t === 'evolve') {
 const inst = this.E.state.players[pi].hand[best.hand];
@@ -24275,6 +24394,25 @@ const f = vflags(key);
 if (!f.length) return 'Normal';
 return f.map(x => VARIANT_BY_KEY[x].label).join(' · ');
 }
+const SETTING_DEFAULTS = {
+prizePick: 'auto', table: 'dusk', cardSize: 'm', emblem: 'logo', thread: 'auto',
+band: 'hybrid', stock: 'neutral', dmgNums: 'rise', coinTrack: 'off',
+};
+const SETTING_VALUES = {
+prizePick: ['auto', 'manual'],
+table: ['dusk', 'dark', 'light'],
+cardSize: ['s', 'm', 'l'],
+emblem: ['logo', 'eclipse', 'coin', 'none'],
+thread: ['auto', 'white', 'offwhite', 'gray', 'dark'],
+band: ['hybrid', 'print', 'ticker'],
+stock: ['neutral', 'era', 'plain'],
+dmgNums: ['stamp', 'rise', 'gauge', 'off'],
+coinTrack: ['on', 'off'],
+};
+function setting(save, key) {
+const v = save && save.settings ? save.settings[key] : undefined;
+return SETTING_VALUES[key].includes(v) ? v : SETTING_DEFAULTS[key];
+}
 function newSave(opts = {}) {
 return {
 v: SAVE_VERSION,
@@ -24285,7 +24423,7 @@ packs: {},
 starter: opts.starter || '',
 stats: { wins: 0, losses: 0, draws: 0, packsOpened: 0, cardsPulled: 0 },
 progress: { beaten: {}, lost: {} },
-settings: { prizePick: 'auto', table: 'dusk', cardSize: 'm', emblem: 'logo', thread: 'auto', band: 'hybrid', stock: 'neutral', dmgNums: 'stamp', coinTrack: 'off' },
+settings: {},
 profile: { name: cleanName(opts.name), birthday: cleanBirthday(opts.birthday) },
 };
 }
@@ -24313,15 +24451,9 @@ if (typeof s.stats[k] !== 'number') s.stats[k] = 0;
 });
 if (typeof s.starter !== 'string') s.starter = '';
 if (s.settings == null || typeof s.settings !== 'object') s.settings = {};
-if (s.settings.prizePick !== 'manual') s.settings.prizePick = 'auto';
-if (!['dusk', 'dark', 'light'].includes(s.settings.table)) s.settings.table = 'dusk';
-if (!['s', 'm', 'l'].includes(s.settings.cardSize)) s.settings.cardSize = 'm';
-if (!['logo', 'eclipse', 'coin', 'none'].includes(s.settings.emblem)) s.settings.emblem = 'logo';
-if (!['auto', 'white', 'offwhite', 'gray', 'dark'].includes(s.settings.thread)) s.settings.thread = 'auto';
-if (!['hybrid', 'print', 'ticker'].includes(s.settings.band)) s.settings.band = 'hybrid';
-if (!['neutral', 'era', 'plain'].includes(s.settings.stock)) s.settings.stock = 'neutral';
-if (!['stamp', 'rise', 'gauge', 'off'].includes(s.settings.dmgNums)) s.settings.dmgNums = 'stamp';
-if (!['on', 'off'].includes(s.settings.coinTrack)) s.settings.coinTrack = 'off';
+for (const k in SETTING_VALUES) {
+if (s.settings[k] !== undefined && !SETTING_VALUES[k].includes(s.settings[k])) delete s.settings[k];
+}
 if (s.profile == null || typeof s.profile !== 'object') s.profile = {};
 s.profile.name = cleanName(s.profile.name);
 s.profile.birthday = cleanBirthday(s.profile.birthday);
@@ -26455,7 +26587,7 @@ applySigilMarks(d, flags);
 return d;
 }
 const SCAN_BASE = 'https://images.pokemontcg.io/';
-const BUILD_STAMP = 'v0.8.1 · a414b45';
+const BUILD_STAMP = 'v0.8.2 · 52afd70';
 function cardFaceImage(card, host) {
 const m = /^([a-z0-9]+)-(.+)$/.exec(card.id || '');
 if (!m) return null;
@@ -26609,7 +26741,9 @@ moved = true;
 }
 if (moved) persist();
 }
-const coinSetting = () => !!(UI.save && UI.save.settings && UI.save.settings.coinTrack === 'on');
+const prefOf = key => UI.save ? setting(UI.save, key)
+: (SETTING_VALUES[key].includes(UI[key]) ? UI[key] : SETTING_DEFAULTS[key]);
+const coinSetting = () => setting(UI.save, 'coinTrack') === 'on';
 function setCoinTrack(on) {
 if (!UI.save) return;
 UI.save.settings.coinTrack = on ? 'on' : 'off';
@@ -27017,10 +27151,7 @@ flushDmgPops();
 }
 UI.dmgQueue = [];
 const DMG_NUMS = [['stamp', 'Stamp'], ['rise', 'Rise'], ['gauge', 'Gauge'], ['off', 'Off']];
-const dmgSetting = () => {
-const v = (UI.save && UI.save.settings && UI.save.settings.dmgNums) || UI.dmgNums;
-return DMG_NUMS.some(x => x[0] === v) ? v : 'stamp';
-};
+const dmgSetting = () => prefOf('dmgNums');
 function setDmgNums(v) {
 if (!DMG_NUMS.some(x => x[0] === v)) return;
 UI.dmgNums = v;
@@ -29321,10 +29452,7 @@ bar.appendChild(yes); bar.appendChild(no);
 return true;
 }
 const TABLES = [['dusk', 'Dusk'], ['dark', 'Dark'], ['light', 'Light']];
-const tableSetting = () => {
-const t = (UI.save && UI.save.settings && UI.save.settings.table) || UI.table;
-return TABLES.some(x => x[0] === t) ? t : 'dusk';
-};
+const tableSetting = () => prefOf('table');
 function setTable(t) {
 if (!TABLES.some(x => x[0] === t)) return;
 UI.table = t;
@@ -29335,10 +29463,7 @@ emblem: [['logo', 'Logo'], ['eclipse', 'Eclipse'], ['coin', 'Coin'], ['none', 'N
 thread: [['auto', 'Auto'], ['white', 'White'], ['offwhite', 'Off-white'], ['gray', 'Grey'], ['dark', 'Dark']],
 band: [['hybrid', 'Hybrid'], ['print', 'Printed'], ['ticker', 'Ticker']],
 };
-const feltSetting = k => {
-const v = (UI.save && UI.save.settings && UI.save.settings[k]) || UI[k];
-return FELT[k].some(x => x[0] === v) ? v : FELT[k][0][0];
-};
+const feltSetting = k => prefOf(k);
 function setFelt(k, v) {
 if (!FELT[k].some(x => x[0] === v)) return;
 UI[k] = v;
@@ -29349,17 +29474,13 @@ const t = feltSetting('thread');
 return t !== 'auto' ? t : (tableSetting() === 'light' ? 'dark' : 'white');
 };
 const STOCKS = [['neutral', 'Neutral'], ['era', 'Era'], ['plain', 'Plain']];
-const stockSetting = () => {
-const v = (UI.save && UI.save.settings && UI.save.settings.stock) || UI.stock;
-return STOCKS.some(x => x[0] === v) ? v : 'neutral';
-};
+const stockSetting = () => prefOf('stock');
 function setStock(v) {
 if (!STOCKS.some(x => x[0] === v)) return;
 UI.stock = v;
 if (UI.save) { UI.save.settings.stock = v; persist(); }
 }
-const prizePickSetting = () =>
-(UI.save && UI.save.settings && UI.save.settings.prizePick === 'manual') ? 'manual' : 'auto';
+const prizePickSetting = () => setting(UI.save, 'prizePick');
 function setPrizePick(mode) {
 if (!UI.save) return;
 UI.save.settings.prizePick = (mode === 'manual') ? 'manual' : 'auto';
@@ -30299,7 +30420,7 @@ head.appendChild(kitLab('TYPE', kitSegs([['all', 'ANY']].concat(POOL_TYPES.map(t
 UI.collType || 'all', re(k => { UI.collType = k; }), 'kit-pips')));
 head.appendChild(kitSearch(UI.collText, re(v => { UI.collText = v; }), 'search by name'));
 const right = el('div', 'kit-zr');
-right.appendChild(kitLab('SIZE', kitSegs(CARD_SIZES, save.settings.cardSize, k => { save.settings.cardSize = k; persist(); render(); })));
+right.appendChild(kitLab('SIZE', kitSegs(CARD_SIZES, setting(save, 'cardSize'), k => { save.settings.cardSize = k; persist(); render(); })));
 head.appendChild(right);
 mat.appendChild(head);
 const pg = el('div', 'kit-page' + (UI.collSlide ? ' in-' + UI.collSlide : '') + (onPage && page.lock ? ' locked' : ''));
@@ -30310,7 +30431,7 @@ const text = (UI.collText || '').trim().toLowerCase();
 const typeSel = UI.collType && UI.collType !== 'all' ? UI.collType : null;
 const typeOf = c => c.kind === 'pokemon' ? c.type : c.kind === 'energy' ? (c.provides || '')[0] : '';
 const passes = c => !(typeSel && typeOf(c) !== typeSel) && !(text && showName(c).toLowerCase().indexOf(text) < 0);
-const grid = keepScroll(el('div', 'collgrid size-' + save.settings.cardSize + (dex ? ' dexgrid' : '')), scrollKey);
+const grid = keepScroll(el('div', 'collgrid size-' + setting(save, 'cardSize') + (dex ? ' dexgrid' : '')), scrollKey);
 let have = 0, total = 0;
 if (dex) {
 const bySpecies = {};
@@ -30633,10 +30754,10 @@ head.appendChild(kitLab('TYPE', kitSegs([['all', 'ANY']].concat(POOL_TYPES.map(t
 f.type, k => refilter(() => { f.type = k; }), 'kit-pips' + (f.kind === 'trainer' ? ' kit-off' : ''))));
 head.appendChild(kitSearch(f.text, v => refilter(() => { f.text = v; }), 'search by name'));
 const right = el('div', 'kit-zr');
-right.appendChild(kitLab('SIZE', kitSegs(CARD_SIZES, UI.save.settings.cardSize, k => { UI.save.settings.cardSize = k; persist(); render(); })));
+right.appendChild(kitLab('SIZE', kitSegs(CARD_SIZES, setting(UI.save, 'cardSize'), k => { UI.save.settings.cardSize = k; persist(); render(); })));
 head.appendChild(right);
 mat.appendChild(head);
-const grid = keepScroll(el('div', 'collgrid size-' + UI.save.settings.cardSize), 'builder-pool');
+const grid = keepScroll(el('div', 'collgrid size-' + setting(UI.save, 'cardSize')), 'builder-pool');
 const poolTile = id => {
 const card = CARD_DB[id];
 if (!poolMatches(card)) return null;
